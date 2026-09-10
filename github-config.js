@@ -15,10 +15,10 @@
 // 現状の設計と同じ考え方です）
 
 window.GITHUB_CONFIG = {
-  owner: "joymoc8831",
-  repo: "cleanup",
+  owner: "YOUR_GITHUB_USERNAME",
+  repo: "YOUR_REPO_NAME",
   branch: "main",
-  token: "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",
+  token: "YOUR_FINE_GRAINED_TOKEN",
 
   // 以下は通常そのままで構いません
   dataDir: "data",       // データJSONを置くフォルダ名
