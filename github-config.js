@@ -15,8 +15,8 @@
 // 現状の設計と同じ考え方です）
 
 window.GITHUB_CONFIG = {
-  owner: "YOUR_GITHUB_USERNAME",
-  repo: "YOUR_REPO_NAME",
+  owner: "joymoc8831",
+  repo: "cleanup",
   branch: "main",
   token: "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",
 
