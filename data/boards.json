@@ -1,0 +1,72 @@
+[
+ {
+  "id": "b01",
+  "name": "グループ1",
+  "order": 1,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b02",
+  "name": "グループ2",
+  "order": 2,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b03",
+  "name": "グループ3",
+  "order": 3,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b04",
+  "name": "グループ4",
+  "order": 4,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b05",
+  "name": "グループ5",
+  "order": 5,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b06",
+  "name": "グループ6",
+  "order": 6,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b07",
+  "name": "グループ7",
+  "order": 7,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b08",
+  "name": "グループ8",
+  "order": 8,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b09",
+  "name": "グループ9",
+  "order": 9,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ },
+ {
+  "id": "b10",
+  "name": "グループ10",
+  "order": 10,
+  "assignments": {},
+  "updatedAt": 1789012252772
+ }
+]
