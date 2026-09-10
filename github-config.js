@@ -18,7 +18,7 @@ window.GITHUB_CONFIG = {
   owner: "YOUR_GITHUB_USERNAME",
   repo: "YOUR_REPO_NAME",
   branch: "main",
-  token: "https://github.com/settings/personal-access-tokens/new",
+  token: "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",
 
   // 以下は通常そのままで構いません
   dataDir: "data",       // データJSONを置くフォルダ名
