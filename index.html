@@ -799,68 +799,247 @@
   </div>
 </div>
 
-<!-- Firebase の設定はこのファイルに書きます。README.md の手順を参照してください -->
-<script src="firebase-config.js"></script>
+<!-- GitHub リポジトリ自体をデータ保存先にします。設定はこのファイルに書きます。README.md の手順を参照してください -->
+<script src="github-config.js"></script>
 
-<script type="module">
-import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
-import {
-  getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, setDoc,
-  getDoc, getDocs, onSnapshot, query, orderBy, limit
-} from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
+<script>
+// ---------- GitHub リポジトリの Contents API を、Firestore ライクな chainable API に見せかけるラッパー ----------
+// (collection().doc().get/set/update/delete/add, collection().orderBy().limit().onSnapshot() など)
+// データは「グループごとに1つのJSONファイル」として、このリポジトリの data/ フォルダにコミットされます。
+// 保存＝GitHubへのコミットなので、外部サービス（Firebase等）は一切不要です。
 
-// ---------- Firestore を、元のシンプルな chainable API に見せかけるラッパー ----------
-// (collection().doc().get/set/update/delete, collection().orderBy().onSnapshot() など)
+function initGithubCompat(){
+  var cfg = window.GITHUB_CONFIG;
+  if (!cfg || !cfg.owner || String(cfg.owner).indexOf("YOUR_") === 0 || !cfg.token || String(cfg.token).indexOf("YOUR_") === 0){
+    console.warn("GitHub未設定: github-config.js を編集してください（README.md参照）");
+    return null;
+  }
 
-function wrapFirestore(firestoreDb){
-  function wrapDocRef(docRef){
+  var branch = cfg.branch || "main";
+  var dataDir = String(cfg.dataDir || "data").replace(/\/+$/,"");
+  var pollMs = cfg.pollIntervalMs || 12000;
+  var apiBase = "https://api.github.com/repos/" + cfg.owner + "/" + cfg.repo + "/contents/";
+
+  function authHeaders(accept){
     return {
-      id: docRef.id,
-      get: function(){ return getDoc(docRef); },
-      set: function(data){ return setDoc(docRef, data); },
-      update: function(data){ return updateDoc(docRef, data); },
-      delete: function(){ return deleteDoc(docRef); }
+      "Authorization": "token " + cfg.token,
+      "Accept": accept || "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28"
     };
   }
-  function wrapQuery(colRef, constraints){
-    function build(){ return constraints.length ? query.apply(null, [colRef].concat(constraints)) : colRef; }
-    return {
-      orderBy: function(field, dir){ return wrapQuery(colRef, constraints.concat([orderBy(field, dir || "asc")])); },
-      limit: function(n){ return wrapQuery(colRef, constraints.concat([limit(n)])); },
-      get: function(){ return getDocs(build()); },
-      onSnapshot: function(next, err){ return onSnapshot(build(), next, err); }
-    };
-  }
-  return {
-    collection: function(path){
-      var colRef = collection(firestoreDb, path);
-      var base = wrapQuery(colRef, []);
-      base.doc = function(id){ return wrapDocRef(doc(colRef, id)); };
-      base.add = function(data){
-        return addDoc(colRef, data).then(function(ref){ return { id: ref.id }; });
-      };
-      return base;
+
+  function b64EncodeUtf8(str){ return btoa(unescape(encodeURIComponent(str))); }
+  function b64DecodeUtf8(str){ return decodeURIComponent(escape(atob(str))); }
+
+  function pathFor(name){ return dataDir + "/" + name + ".json"; }
+
+  // ファイルの中身(items配列)と sha を両方取得する。
+  // 1MB以下はメタデータ取得と同じリクエストで content も取れる。
+  // 1MB超の場合は content が空で返ってくるので、raw で本文だけ追加取得する（写真が増えても壊れないように）。
+  async function fetchFile(name){
+    var url = apiBase + pathFor(name) + "?ref=" + encodeURIComponent(branch) + "&_ts=" + Date.now();
+    var res = await fetch(url, {headers: authHeaders("application/vnd.github.object+json"), cache: "no-store"});
+    if (res.status === 404){
+      return {items: [], sha: null};
     }
+    if (!res.ok){
+      var errText = await res.text().catch(function(){ return ""; });
+      throw new Error("github_read_failed_" + res.status + ":" + errText.slice(0,200));
+    }
+    var meta = await res.json();
+    var text;
+    if (meta.encoding === "base64" && meta.content){
+      text = b64DecodeUtf8(meta.content.replace(/\n/g, ""));
+    } else {
+      var rawRes = await fetch(url, {headers: authHeaders("application/vnd.github.raw+json"), cache: "no-store"});
+      if (!rawRes.ok) throw new Error("github_raw_read_failed_" + rawRes.status);
+      text = await rawRes.text();
+    }
+    var items;
+    try { items = JSON.parse(text); } catch(e){ items = []; }
+    if (!Array.isArray(items)) items = [];
+    return {items: items, sha: meta.sha || null};
+  }
+
+  async function writeFile(name, items, sha, message){
+    var url = apiBase + pathFor(name);
+    var body = {
+      message: message || ("update " + name + ".json"),
+      content: b64EncodeUtf8(JSON.stringify(items, null, 1)),
+      branch: branch
+    };
+    if (sha) body.sha = sha;
+    var res = await fetch(url, {
+      method: "PUT",
+      headers: Object.assign({"Content-Type":"application/json"}, authHeaders()),
+      body: JSON.stringify(body)
+    });
+    if (!res.ok){
+      var errText = await res.text().catch(function(){ return ""; });
+      var err = new Error("github_write_failed_" + res.status + ":" + errText.slice(0,300));
+      err.status = res.status;
+      throw err;
+    }
+    var json = await res.json();
+    return json.content ? json.content.sha : null;
+  }
+
+  // 同一コレクションへの書き込みを直列化しつつ、sha競合(409/422)時は最新を取り直してリトライする
+  var writeChains = {};
+  function chain(name, fn){
+    var prev = writeChains[name] || Promise.resolve();
+    var next = prev.then(fn, fn);
+    writeChains[name] = next.catch(function(){});
+    return next;
+  }
+
+  async function mutate(name, mutator, message){
+    return chain(name, async function(){
+      var attempts = 0;
+      while (true){
+        attempts++;
+        var current = await fetchFile(name);
+        var nextItems = mutator(current.items.slice());
+        try{
+          await writeFile(name, nextItems, current.sha, message);
+          return nextItems;
+        }catch(e){
+          if ((e.status === 409 || e.status === 422) && attempts < 5) continue;
+          throw e;
+        }
+      }
+    });
+  }
+
+  function toDocSnap(item){
+    var id = item.id;
+    var data = Object.assign({}, item);
+    delete data.id;
+    return {id: id, data: function(){ return data; }, exists: true};
+  }
+
+  function sortItems(items, field, dir){
+    var copy = items.slice();
+    copy.sort(function(a,b){
+      var av = a[field], bv = b[field];
+      if (av === bv) return 0;
+      if (av < bv) return dir === "desc" ? 1 : -1;
+      return dir === "desc" ? -1 : 1;
+    });
+    return copy;
+  }
+
+  function makeCollection(name){
+    var listeners = [];
+    var pollTimer = null;
+    var lastText = null;
+
+    function notify(items){
+      listeners.forEach(function(l){
+        var view = items;
+        if (l.orderField) view = sortItems(view, l.orderField, l.orderDir);
+        if (l.limitN != null) view = view.slice(0, l.limitN);
+        try{
+          l.next({docs: view.map(toDocSnap), empty: view.length === 0});
+        }catch(e){ console.error("onSnapshot handler error", e); }
+      });
+    }
+
+    async function poll(force){
+      try{
+        var res = await fetchFile(name);
+        var text = JSON.stringify(res.items);
+        if (force || text !== lastText){
+          lastText = text;
+          notify(res.items);
+        }
+      }catch(e){
+        listeners.forEach(function(l){ if (l.err) l.err(e); });
+      }
+    }
+
+    function ensurePolling(){
+      if (pollTimer) return;
+      poll(true);
+      pollTimer = setInterval(function(){ poll(false); }, pollMs);
+    }
+
+    function refreshSoon(){ lastText = null; poll(true); }
+
+    function buildQuery(orderField, orderDir, limitN){
+      return {
+        orderBy: function(field, dir){ return buildQuery(field, dir || "asc", limitN); },
+        limit: function(n){ return buildQuery(orderField, orderDir, n); },
+        get: async function(){
+          var res = await fetchFile(name);
+          var view = res.items;
+          if (orderField) view = sortItems(view, orderField, orderDir);
+          if (limitN != null) view = view.slice(0, limitN);
+          return {docs: view.map(toDocSnap), empty: view.length === 0};
+        },
+        onSnapshot: function(next, err){
+          var l = {next: next, err: err, orderField: orderField, orderDir: orderDir, limitN: limitN};
+          listeners.push(l);
+          ensurePolling();
+          return function unsubscribe(){ listeners = listeners.filter(function(x){ return x !== l; }); };
+        }
+      };
+    }
+
+    var base = buildQuery(null, "asc", null);
+    base.doc = function(id){
+      return {
+        id: id,
+        get: async function(){
+          var res = await fetchFile(name);
+          var found = res.items.find(function(it){ return it.id === id; });
+          if (!found) return {exists: false, id: id, data: function(){ return undefined; }};
+          return toDocSnap(found);
+        },
+        set: async function(data){
+          await mutate(name, function(items){
+            var idx = items.findIndex(function(it){ return it.id === id; });
+            var doc = Object.assign({id: id}, data);
+            if (idx === -1) items.push(doc); else items[idx] = doc;
+            return items;
+          }, "set " + name + "/" + id);
+          refreshSoon();
+        },
+        update: async function(data){
+          await mutate(name, function(items){
+            var idx = items.findIndex(function(it){ return it.id === id; });
+            if (idx === -1) items.push(Object.assign({id: id}, data));
+            else items[idx] = Object.assign({}, items[idx], data);
+            return items;
+          }, "update " + name + "/" + id);
+          refreshSoon();
+        },
+        delete: async function(){
+          await mutate(name, function(items){
+            return items.filter(function(it){ return it.id !== id; });
+          }, "delete " + name + "/" + id);
+          refreshSoon();
+        }
+      };
+    };
+    base.add = async function(data){
+      var newId = name.slice(0,1) + "_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2,8);
+      await mutate(name, function(items){
+        items.push(Object.assign({id: newId}, data));
+        return items;
+      }, "add " + name + "/" + newId);
+      refreshSoon();
+      return {id: newId};
+    };
+    return base;
+  }
+
+  return {
+    collection: function(name){ return makeCollection(name); }
   };
 }
 
-function initFirestoreCompat(){
-  try{
-    var cfg = window.FIREBASE_CONFIG;
-    if (!cfg || !cfg.apiKey || cfg.apiKey.indexOf("YOUR_") === 0){
-      console.warn("Firebase未設定: firebase-config.js を編集してください（README.md参照）");
-      return null;
-    }
-    var app = initializeApp(cfg);
-    var firestoreDb = getFirestore(app);
-    return wrapFirestore(firestoreDb);
-  }catch(e){
-    console.error("firebase init failed", e);
-    return null;
-  }
-}
-
-window.__initFirestoreCompat = initFirestoreCompat;
+window.__initDbCompat = initGithubCompat;
 </script>
 
 <script>
@@ -962,7 +1141,7 @@ window.__initFirestoreCompat = initFirestoreCompat;
   }
 
   async function main(){
-    var db = (typeof window.__initFirestoreCompat === "function") ? window.__initFirestoreCompat() : null;
+    var db = (typeof window.__initDbCompat === "function") ? window.__initDbCompat() : null;
 
     var connDot = document.getElementById("connDot");
     var connNote = document.getElementById("connNote");
@@ -985,7 +1164,7 @@ window.__initFirestoreCompat = initFirestoreCompat;
 
     if (!db){
       connDot.classList.remove("ok");
-      connNote.textContent = "Firebase未設定のため保存されません（README.mdの手順で設定してください）";
+      connNote.textContent = "GitHub未設定のため保存されません（README.mdの手順で設定してください）";
       seedLocalData();
     } else {
       connDot.classList.add("ok");
@@ -1009,7 +1188,7 @@ window.__initFirestoreCompat = initFirestoreCompat;
       }, function(err){
         console.error("roster subscription error", err);
         connDot.classList.remove("ok");
-        connNote.textContent = "接続エラー（Firestoreのルール・設定を確認してください）";
+        connNote.textContent = "接続エラー（github-config.jsのトークン・設定を確認してください）";
       });
 
       boardsCol.orderBy("order","asc").onSnapshot(function(snap){
@@ -1033,7 +1212,7 @@ window.__initFirestoreCompat = initFirestoreCompat;
       }, function(err){
         console.error("boards subscription error", err);
         connDot.classList.remove("ok");
-        connNote.textContent = "接続エラー（Firestoreのルール・設定を確認してください）";
+        connNote.textContent = "接続エラー（github-config.jsのトークン・設定を確認してください）";
       });
     }
 
